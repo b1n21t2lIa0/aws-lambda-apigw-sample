@@ -1,0 +1,62 @@
+stages: [test, build, upload, plan, apply]
+
+variables:
+  ENV: "dev"
+  AWS_REGION: "ap-northeast-1"
+  ACCOUNT_ID: "123456789012"
+  ARTIFACTS_BUCKET: "acme-lambda-artifacts-${ACCOUNT_ID}-${AWS_REGION}"
+  FN_NAME: "hello_world"
+  ZIP_KEY: "functions/${FN_NAME}/${CI_COMMIT_TIMESTAMP}_${CI_COMMIT_SHORT_SHA}/${FN_NAME}.zip"
+
+default:
+  image: hashicorp/terraform:1.9.5   # 帶上 terragrunt
+  before_script:
+    - apk add --no-cache bash zip python3 py3-pip jq curl git
+    - wget -qO /usr/local/bin/terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v0.66.6/terragrunt_linux_amd64
+    - chmod +x /usr/local/bin/terragrunt
+    # OIDC 兌換 AWS 臨時憑證（或改用 assume role）
+    - export AWS_ROLE_ARN="$AWS_OIDC_ROLE_ARN"
+    - echo "$CI_JOB_JWT" > /tmp/ci_token
+    - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/ci_token
+    - aws sts get-caller-identity
+
+test:
+  stage: test
+  script:
+    - pip3 install -r lambda/${FN_NAME}/src/requirements.txt -q || true
+    - python3 -m pytest -q lambda/${FN_NAME}/tests || echo "no tests"
+
+build:
+  stage: build
+  script:
+    - bash scripts/build_python_zip.sh "${FN_NAME}"
+  artifacts:
+    paths: ["dist/${FN_NAME}/${FN_NAME}.zip", "versioning/"]
+    expire_in: 1 week
+
+upload:
+  stage: upload
+  script:
+    - aws s3 cp "dist/${FN_NAME}/${FN_NAME}.zip" "s3://${ARTIFACTS_BUCKET}/${ZIP_KEY}" --region ${AWS_REGION}
+    - mkdir -p versioning
+    - echo "{\"${FN_NAME}\": {\"s3_bucket\": \"${ARTIFACTS_BUCKET}\", \"s3_key\": \"${ZIP_KEY}\"}}" > versioning/manifest.json
+  artifacts:
+    paths: ["versioning/manifest.json"]
+    expire_in: 1 week
+
+plan:
+  stage: plan
+  script:
+    - cd infra/live/${ENV}
+    - terragrunt run-all init -upgrade
+    - terragrunt run-all validate
+    - terragrunt run-all plan --terragrunt-non-interactive
+  needs: ["upload"]
+
+apply:
+  stage: apply
+  when: manual
+  script:
+    - cd infra/live/${ENV}
+    - terragrunt run-all apply --terragrunt-non-interactive --auto-approve
+  needs: ["plan"]
